@@ -10,3 +10,8 @@ __pycache__/
 input.txt
 env/
 venv/
+cuda/
+cuda3/
+cuda2_optimised/
+.mypy_cache/
+wandb/
