@@ -88,10 +88,14 @@ class ActivationConfig:
             return AdaptiveReLUBoundedActivation()
         elif self.name == 'hybrid_relu_bounded':
             return HybridReLUBoundedActivation()
+        elif self.name == 'hybrid_relu_bounded_ce_loss':
+            return HybridReLUBoundedActivationCELoss()
         elif self.name == 'gradient_stable_relu_bounded':
             return GradientStableReLUBoundedActivation()
         elif self.name == 'dynamic_hybrid': #next
             return DynamicHybridActivation(self.temperature)
+        elif self.name == 'dynamic_hybrid_ce_loss':
+            return DynamicHybridActivationCELoss(self.temperature)
         elif self.name == 'gated_hybrid':
             return GatedHybridActivation()
         elif self.name == 'residual_hybrid':
@@ -357,6 +361,51 @@ class ScaleAwareGradientStableReLUActivation(OutputActivation):
             mask = (targets != ignore_index)
             loss = loss * mask
             return loss.sum() / (mask.sum() + 1e-10)
+        return loss.mean()
+
+
+class DynamicHybridActivationCELoss(OutputActivation):
+    def __init__(self, alpha=0.5, temperature=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.temperature = temperature
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Adaptive temperature based on input scale
+        temp = self.temperature / (1 + torch.log1p(torch.std(x, dim=-1, keepdim=True)))
+        
+        # Softmax with adaptive temperature
+        soft_probs = F.softmax(x / temp, dim=-1)
+        
+        # ReLU bounded component
+        scale = torch.log1p(F.relu(x))
+        bounded = torch.tanh(x / (1 + scale))
+        relu_probs = (bounded + 1) / 2
+        
+        # Dynamic mixing based on prediction entropy
+        entropy = -(soft_probs * torch.log(soft_probs + 1e-10)).sum(dim=-1, keepdim=True)
+        dynamic_alpha = self.alpha * torch.sigmoid(-entropy)
+        
+        combined = dynamic_alpha * relu_probs + (1 - dynamic_alpha) * soft_probs
+        return combined / (combined.sum(dim=-1, keepdim=True) + 1e-10)
+
+    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+        probs = self.forward(logits)
+        # Stabilize probabilities
+        probs = torch.clamp(probs, min=1e-10, max=1.0)
+        
+        # Create one-hot encoded targets
+        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+        
+        # Compute cross entropy with stability terms
+        loss = -torch.sum(target_one_hot * torch.log(probs + 1e-10), dim=-1)
+
+        # Handle ignore_index
+        if ignore_index >= 0:
+            mask = (targets != ignore_index)
+            loss = loss * mask
+            return loss.sum() / (mask.sum() + 1e-10)
+        
         return loss.mean()
 
 
@@ -634,6 +683,49 @@ class AdaptiveReLUBoundedActivation(OutputActivation):
             loss = loss * mask
             return loss.sum() / (mask.sum() + 1e-10)
         return loss.mean()
+
+class HybridReLUBoundedActivationCELoss(OutputActivation):
+    """
+    Hybrid approach combining ReLU with softmax-like behavior
+    """
+    def __init__(self, alpha=0.5):
+        super().__init__()
+        self.alpha = alpha
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ReLU-based component
+        scale = torch.log1p(F.relu(x))
+        bounded = torch.tanh(x / (1 + scale))
+        relu_probs = (bounded + 1) / 2
+        
+        # Softmax-like component
+        soft_probs = F.softmax(x, dim=-1)
+        
+        # Combine both
+        combined = self.alpha * relu_probs + (1 - self.alpha) * soft_probs
+        return combined / (combined.sum(dim=-1, keepdim=True) + 1e-10)
+
+    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+        probs = self.forward(logits)
+        # Stabilize probabilities
+        probs = torch.clamp(probs, min=1e-10, max=1.0)
+        
+        # Create one-hot encoded targets
+        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+        
+        # Compute cross entropy with stability terms
+        # loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
+        loss = -torch.sum(target_one_hot * torch.log(probs + 1e-10), dim=-1)
+
+        # Handle ignore_index
+        if ignore_index >= 0:
+            mask = (targets != ignore_index)
+            loss = loss * mask
+            return loss.sum() / (mask.sum() + 1e-10)
+        
+        return loss.mean()
+
+
 
 class HybridReLUBoundedActivation(OutputActivation):
     """
