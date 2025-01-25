@@ -26,6 +26,7 @@ class ActivationConfig:
     temperature: float = 1.0  # Temperature parameter for controlling distribution sharpness
     scale_factor: float = 1.0  # Base scaling factor for logits
     min_temp: float = 1.0  # Minimum temperature for adaptive temperature functions
+    alpha: float = 0.3  # Initial mixing parameter
 
     def get_activation(self):
         """Get the activation function instance based on config."""
@@ -116,17 +117,206 @@ class ActivationConfig:
             return ScaleAwareGradientStableReLUActivation(self.temperature)
         elif self.name == 'dynamic_gradient_stable_relu':
             return DynamicGradientStableReLUActivation(self.scale_factor)
+        elif self.name == 'dynamic_hybrid_activation2':
+            return DynamicHybridActivation2(self.alpha, self.temperature)
+        elif self.name == 'residual_hybrid_activation2':
+            return ResidualHybridActivation2(self.alpha)
+        elif self.name == 'hybrid_relu_bounded_activation2':
+            return HybridReLUBoundedActivation2(self.alpha)
+        elif self.name == 'gated_hybrid_activation2':
+            return GatedHybridActivation2(self.alpha)
+        elif self.name == 'dynamic_hybrid_activation_optimised':
+            return DynamicHybridActivationOptimised(self.alpha, self.temperature)
         else:
             raise ValueError(f"Unknown activation: {self.name}")
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+class DynamicHybridActivationOptimised(nn.Module):
+    def __init__(self, alpha: float = 0.5, temperature: float = 1.0):
+        super().__init__()
+        self.register_buffer('alpha', torch.tensor(alpha))
+        self.register_buffer('temperature', torch.tensor(temperature))
+        self.eps = 1e-6
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, min=-100, max=100)  # Prevent extreme values
+        std = torch.clamp(torch.std(x, dim=-1, keepdim=True), min=self.eps)
+        temp = torch.clamp(self.temperature / (1 + torch.log1p(std)), min=self.eps)
+        
+        # Safe softmax
+        x_scaled = x / temp
+        x_max = x_scaled.max(dim=-1, keepdim=True)[0]
+        exp_x = torch.exp(torch.clamp(x_scaled - x_max, min=-15, max=15))
+        denom = torch.clamp(exp_x.sum(dim=-1, keepdim=True), min=self.eps)
+        soft_probs = exp_x / denom
+        
+        # Bounded component
+        scale = torch.log1p(F.relu(x)) + self.eps
+        bounded = torch.tanh(x / scale)
+        relu_probs = (bounded + 1) / 2
+        
+        # Safe entropy calculation
+        log_soft = torch.log(soft_probs + self.eps)
+        entropy = torch.clamp(-(soft_probs * log_soft).sum(dim=-1, keepdim=True), min=-20, max=20)
+        dynamic_alpha = self.alpha * torch.sigmoid(-entropy)
+        
+        combined = dynamic_alpha * relu_probs + (1 - dynamic_alpha) * soft_probs
+        return combined / torch.clamp(combined.sum(dim=-1, keepdim=True), min=self.eps)
+
+    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+        probs = self.forward(logits)
+        log_probs = torch.log(torch.clamp(probs, min=self.eps))
+        
+        loss = -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        
+        if ignore_index >= 0:
+            mask = (targets != ignore_index)
+            denom = torch.clamp(mask.sum(), min=self.eps)
+            return (loss * mask).sum() / denom
+            
+        return loss.mean()
+
+
 class OutputActivation(nn.Module):
-    """Base class for output activation functions."""
+    """Base class for output activation functions and loss computation."""
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Transform logits into probability distribution."""
         raise NotImplementedError
     
     def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-        raise NotImplementedError
+        """Compute loss between predictions and targets.
+        
+        Args:
+            logits: Raw model outputs of shape (batch_size, seq_len, vocab_size)
+            targets: Target indices of shape (batch_size, seq_len)
+            ignore_index: Index to ignore in loss computation (default: -1)
+            
+        Returns:
+            Scalar loss value
+        """
+        # Convert logits to probabilities using the activation function
+        probs = self.forward(logits)
+        probs = torch.clamp(probs, min=1e-10, max=1.0)
+        
+        # Create one-hot encoded targets
+        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+        
+        # Compute cross entropy loss
+        loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
+        
+        # Handle ignore_index
+        if ignore_index >= 0:
+            mask = (targets != ignore_index)
+            loss = loss * mask
+            return loss.sum() / (mask.sum() + 1e-10)
+        
+        return loss.mean()
+
+
+class DynamicHybridActivation2(OutputActivation):
+    """Dynamic hybrid activation that adapts based on input statistics."""
+    
+    def __init__(self, alpha: float = 0.5, temperature: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.temperature = temperature
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Adaptive temperature based on input scale
+        temp = self.temperature / (1 + torch.log1p(torch.std(x, dim=-1, keepdim=True)))
+        
+        # Softmax with adaptive temperature
+        soft_probs = F.softmax(x / temp, dim=-1)
+        
+        # ReLU bounded component
+        scale = torch.log1p(F.relu(x))
+        bounded = torch.tanh(x / (1 + scale))
+        relu_probs = (bounded + 1) / 2
+        
+        # Dynamic mixing based on prediction entropy
+        entropy = -(soft_probs * torch.log(soft_probs + 1e-10)).sum(dim=-1, keepdim=True)
+        dynamic_alpha = self.alpha * torch.sigmoid(-entropy)
+        
+        combined = dynamic_alpha * relu_probs + (1 - dynamic_alpha) * soft_probs
+        return combined / (combined.sum(dim=-1, keepdim=True) + 1e-10)
+
+
+class ResidualHybridActivation2(OutputActivation):
+    """Hybrid activation with residual connections between components."""
+    
+    def __init__(self, alpha: float = 0.3):
+        super().__init__()
+        self.alpha = alpha
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Base softmax
+        soft_probs = F.softmax(x, dim=-1)
+        
+        # ReLU residual path
+        scale = torch.log1p(F.relu(x))
+        bounded = torch.tanh(x / (1 + scale))
+        relu_probs = (bounded + 1) / 2
+        
+        # Residual connection
+        residual = self.alpha * (relu_probs - soft_probs)
+        combined = soft_probs + residual
+        return combined / (combined.sum(dim=-1, keepdim=True) + 1e-10)
+
+
+class HybridReLUBoundedActivation2(OutputActivation):
+    """Simple hybrid approach combining ReLU-based normalization with softmax."""
+    
+    def __init__(self, alpha: float = 0.5):
+        super().__init__()
+        self.alpha = alpha
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ReLU-based component
+        scale = torch.log1p(F.relu(x))
+        bounded = torch.tanh(x / (1 + scale))
+        relu_probs = (bounded + 1) / 2
+        
+        # Softmax component
+        soft_probs = F.softmax(x, dim=-1)
+        
+        # Combine both paths
+        combined = self.alpha * relu_probs + (1 - self.alpha) * soft_probs
+        return combined / (combined.sum(dim=-1, keepdim=True) + 1e-10)
+
+
+class GatedHybridActivation2(OutputActivation):
+    """Hybrid activation with learned gating between components."""
+    
+    def __init__(self, alpha: float = 0.5):
+        super().__init__()
+        self.alpha = alpha
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Standard softmax path
+        soft_probs = F.softmax(x, dim=-1)
+        
+        # Gated ReLU path
+        gate = torch.sigmoid(torch.max(x, dim=-1, keepdim=True)[0])
+        scale = torch.log1p(F.relu(x))
+        bounded = torch.tanh(x / (1 + scale))
+        relu_probs = (bounded + 1) / 2
+        
+        # Gated combination
+        combined = gate * (self.alpha * relu_probs + (1 - self.alpha) * soft_probs) + \
+                  (1 - gate) * soft_probs
+        return combined / (combined.sum(dim=-1, keepdim=True) + 1e-10)
+    
+
+
+
+
+
 
 class EnhancedGradientStableReLUActivation(OutputActivation):
     def __init__(self, scale_factor=0.3):
@@ -143,24 +333,24 @@ class EnhancedGradientStableReLUActivation(OutputActivation):
         probs = (bounded + 1) / 2
         return probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
 
-    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-        probs = self.forward(logits)
-        probs = torch.clamp(probs, min=1e-10, max=1.0)
+    # def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+    #     probs = self.forward(logits)
+    #     probs = torch.clamp(probs, min=1e-10, max=1.0)
         
-        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+    #     target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
         
-        # Cross entropy with gradient stability regularization
-        ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
-        norm = torch.norm(logits, dim=-1)
-        reg_loss = 0.01 * torch.log1p(norm)
+    #     # Cross entropy with gradient stability regularization
+    #     ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
+    #     norm = torch.norm(logits, dim=-1)
+    #     reg_loss = 0.01 * torch.log1p(norm)
         
-        loss = ce_loss + reg_loss
+    #     loss = ce_loss + reg_loss
         
-        if ignore_index >= 0:
-            mask = (targets != ignore_index)
-            loss = loss * mask
-            return loss.sum() / (mask.sum() + 1e-10)
-        return loss.mean()
+    #     if ignore_index >= 0:
+    #         mask = (targets != ignore_index)
+    #         loss = loss * mask
+    #         return loss.sum() / (mask.sum() + 1e-10)
+    #     return loss.mean()
 
 class AdaptiveGradientStableReLUActivation(OutputActivation):
     def __init__(self, base_scale=0.5):
@@ -179,24 +369,24 @@ class AdaptiveGradientStableReLUActivation(OutputActivation):
         probs = (bounded + 1) / 2
         return probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
 
-    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-        probs = self.forward(logits)
-        probs = torch.clamp(probs, min=1e-10, max=1.0)
+    # def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+    #     probs = self.forward(logits)
+    #     probs = torch.clamp(probs, min=1e-10, max=1.0)
         
-        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+    #     target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
         
-        # Adaptive cross entropy with normalization penalty
-        ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
-        std = torch.std(logits, dim=-1)
-        reg_loss = 0.01 * torch.log1p(std)
+    #     # Adaptive cross entropy with normalization penalty
+    #     ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
+    #     std = torch.std(logits, dim=-1)
+    #     reg_loss = 0.01 * torch.log1p(std)
         
-        loss = ce_loss + reg_loss
+    #     loss = ce_loss + reg_loss
         
-        if ignore_index >= 0:
-            mask = (targets != ignore_index)
-            loss = loss * mask
-            return loss.sum() / (mask.sum() + 1e-10)
-        return loss.mean()
+    #     if ignore_index >= 0:
+    #         mask = (targets != ignore_index)
+    #         loss = loss * mask
+    #         return loss.sum() / (mask.sum() + 1e-10)
+    #     return loss.mean()
 
 class HybridGradientStableReLUActivation(OutputActivation):
     def __init__(self, alpha=0.3):
@@ -215,25 +405,25 @@ class HybridGradientStableReLUActivation(OutputActivation):
         probs = (bounded + 1) / 2
         return probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
 
-    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-        probs = self.forward(logits)
-        probs = torch.clamp(probs, min=1e-10, max=1.0)
+    # def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+    #     probs = self.forward(logits)
+    #     probs = torch.clamp(probs, min=1e-10, max=1.0)
         
-        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+    #     target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
         
-        # Hybrid loss with balanced regularization
-        ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
-        norm = torch.norm(logits, dim=-1)
-        relu_term = torch.mean(F.relu(logits), dim=-1)
-        reg_loss = 0.01 * (self.alpha * torch.log1p(norm) + (1 - self.alpha) * torch.log1p(relu_term))
+    #     # Hybrid loss with balanced regularization
+    #     ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
+    #     norm = torch.norm(logits, dim=-1)
+    #     relu_term = torch.mean(F.relu(logits), dim=-1)
+    #     reg_loss = 0.01 * (self.alpha * torch.log1p(norm) + (1 - self.alpha) * torch.log1p(relu_term))
         
-        loss = ce_loss + reg_loss
+    #     loss = ce_loss + reg_loss
         
-        if ignore_index >= 0:
-            mask = (targets != ignore_index)
-            loss = loss * mask
-            return loss.sum() / (mask.sum() + 1e-10)
-        return loss.mean()
+    #     if ignore_index >= 0:
+    #         mask = (targets != ignore_index)
+    #         loss = loss * mask
+    #         return loss.sum() / (mask.sum() + 1e-10)
+    #     return loss.mean()
 
 class ResidualGradientStableReLUActivation(OutputActivation):
     def __init__(self, scale_factor=0.1):
@@ -252,24 +442,24 @@ class ResidualGradientStableReLUActivation(OutputActivation):
         probs = (bounded + 1) / 2
         return probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
 
-    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-        probs = self.forward(logits)
-        probs = torch.clamp(probs, min=1e-10, max=1.0)
+    # def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+    #     probs = self.forward(logits)
+    #     probs = torch.clamp(probs, min=1e-10, max=1.0)
         
-        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+    #     target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
         
-        # Residual-aware loss
-        ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
-        residual_term = torch.norm(F.relu(logits), dim=-1)
-        reg_loss = 0.01 * self.scale_factor * torch.log1p(residual_term)
+    #     # Residual-aware loss
+    #     ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
+    #     residual_term = torch.norm(F.relu(logits), dim=-1)
+    #     reg_loss = 0.01 * self.scale_factor * torch.log1p(residual_term)
         
-        loss = ce_loss + reg_loss
+    #     loss = ce_loss + reg_loss
         
-        if ignore_index >= 0:
-            mask = (targets != ignore_index)
-            loss = loss * mask
-            return loss.sum() / (mask.sum() + 1e-10)
-        return loss.mean()
+    #     if ignore_index >= 0:
+    #         mask = (targets != ignore_index)
+    #         loss = loss * mask
+    #         return loss.sum() / (mask.sum() + 1e-10)
+    #     return loss.mean()
 
 class DynamicGradientStableReLUActivation(OutputActivation):
     def __init__(self, base_scale=0.5, adapt_rate=0.1):
@@ -290,27 +480,27 @@ class DynamicGradientStableReLUActivation(OutputActivation):
         probs = (bounded + 1) / 2
         return probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
 
-    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-        probs = self.forward(logits)
-        probs = torch.clamp(probs, min=1e-10, max=1.0)
+    # def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+    #     probs = self.forward(logits)
+    #     probs = torch.clamp(probs, min=1e-10, max=1.0)
         
-        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+    #     target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
         
-        # Dynamic adaptation-aware loss
-        ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
+    #     # Dynamic adaptation-aware loss
+    #     ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
         
-        norm = torch.norm(logits, dim=-1)
-        max_val = torch.max(logits, dim=-1)[0]
-        adapt_term = torch.sigmoid(self.adapt_rate * (max_val - norm))
-        reg_loss = 0.01 * (self.base_scale * torch.log1p(norm) + adapt_term)
+    #     norm = torch.norm(logits, dim=-1)
+    #     max_val = torch.max(logits, dim=-1)[0]
+    #     adapt_term = torch.sigmoid(self.adapt_rate * (max_val - norm))
+    #     reg_loss = 0.01 * (self.base_scale * torch.log1p(norm) + adapt_term)
         
-        loss = ce_loss + reg_loss
+    #     loss = ce_loss + reg_loss
         
-        if ignore_index >= 0:
-            mask = (targets != ignore_index)
-            loss = loss * mask
-            return loss.sum() / (mask.sum() + 1e-10)
-        return loss.mean()
+    #     if ignore_index >= 0:
+    #         mask = (targets != ignore_index)
+    #         loss = loss * mask
+    #         return loss.sum() / (mask.sum() + 1e-10)
+    #     return loss.mean()
 
 
 class ScaleAwareGradientStableReLUActivation(OutputActivation):
@@ -335,33 +525,33 @@ class ScaleAwareGradientStableReLUActivation(OutputActivation):
         probs = (bounded + 1) / 2
         return probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
 
-    def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-        probs = self.forward(logits)
-        probs = torch.clamp(probs, min=1e-10, max=1.0)
+    # def loss(self, logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
+    #     probs = self.forward(logits)
+    #     probs = torch.clamp(probs, min=1e-10, max=1.0)
         
-        target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
+    #     target_one_hot = F.one_hot(targets, num_classes=logits.size(-1)).float()
         
-        # Scale-aware cross entropy with temperature-based regularization
-        ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
+    #     # Scale-aware cross entropy with temperature-based regularization
+    #     ce_loss = -torch.sum(target_one_hot * torch.log(probs), dim=-1)
         
-        # Scale-aware regularization
-        norm = torch.norm(logits, dim=-1)
-        scale_factor = torch.tanh(norm / self.temperature)
-        magnitude_gate = torch.sigmoid(norm - self.temperature)
+    #     # Scale-aware regularization
+    #     norm = torch.norm(logits, dim=-1)
+    #     scale_factor = torch.tanh(norm / self.temperature)
+    #     magnitude_gate = torch.sigmoid(norm - self.temperature)
         
-        # Combined regularization term that considers both scale and magnitude
-        reg_loss = 0.01 * (
-            scale_factor * torch.log1p(norm) +  # Scale-dependent term
-            magnitude_gate * torch.abs(norm - self.temperature)  # Magnitude penalty
-        )
+    #     # Combined regularization term that considers both scale and magnitude
+    #     reg_loss = 0.01 * (
+    #         scale_factor * torch.log1p(norm) +  # Scale-dependent term
+    #         magnitude_gate * torch.abs(norm - self.temperature)  # Magnitude penalty
+    #     )
         
-        loss = ce_loss + reg_loss
+    #     loss = ce_loss + reg_loss
         
-        if ignore_index >= 0:
-            mask = (targets != ignore_index)
-            loss = loss * mask
-            return loss.sum() / (mask.sum() + 1e-10)
-        return loss.mean()
+    #     if ignore_index >= 0:
+    #         mask = (targets != ignore_index)
+    #         loss = loss * mask
+    #         return loss.sum() / (mask.sum() + 1e-10)
+    #     return loss.mean()
 
 
 class DynamicHybridActivationCELoss(OutputActivation):

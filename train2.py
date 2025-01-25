@@ -42,7 +42,7 @@ always_save_checkpoint = True  # if True, always save a checkpoint after each ev
 init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True  # disabled by default
-wandb_project = "nanogpt_owt"
+wandb_project = "nanogpt"
 wandb_run_name = "logistic_bounded"  # 'run' + str(time.time())
 # data
 dataset = "openwebtext"
@@ -66,12 +66,12 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 200  # how many steps to warm up for
 lr_decay_iters = 1000  # should be ~= max_iters per Chinchilla
-min_lr = 6e-5  # was 6e-5 minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = "nccl"  # 'nccl', 'gloo', etc.
 # system
 device = (
-    "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+    "cuda:1"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 )
 dtype = (
     "bfloat16"
@@ -94,7 +94,7 @@ block_size = 256
 
 # this makes total number of tokens be 300B
 max_iters = 6000
-lr_decay_iters = 6000 # was 6000
+lr_decay_iters = 6000
 
 # eval stuff
 eval_interval = 100
@@ -104,8 +104,9 @@ log_interval = 10
 # weight decay
 weight_decay = 1e-1
 
-alpha=0.8
-temperature=0.8
+temperature=1.0
+alpha=0.85
+scale_factor=0.6
 
 
 
@@ -230,7 +231,7 @@ model_args = dict(
     bias=bias,
     vocab_size=None,
     dropout=dropout,
-    activation=ActivationConfig(name=wandb_run_name, temperature=temperature, alpha=alpha)
+    activation=ActivationConfig(name=wandb_run_name, temperature=temperature, alpha=alpha, scale_factor=scale_factor)
 )  # start with model_args from command line
 
 
